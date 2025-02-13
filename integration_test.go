@@ -1181,6 +1181,77 @@ func TestMultipleSendersSharedSession(t *testing.T) {
 	checkLeaks()
 }
 
+func TestDrainingLink(t *testing.T) {
+	if localBrokerAddr == "" {
+		t.Skip()
+	}
+
+	queue := fmt.Sprintf("TestDrainingLink-%d", rand.Int63())
+
+	conn, err := amqp.Dial(context.Background(), localBrokerAddr, nil)
+	require.NoError(t, err)
+
+	session, err := conn.NewSession(context.Background(), nil)
+	require.NoError(t, err)
+
+	receiver, err := session.NewReceiver(context.Background(), queue, &amqp.ReceiverOptions{
+		Credit:         -1,
+		SettlementMode: amqp.ReceiverSettleModeSecond.Ptr(),
+	})
+	require.NoError(t, err)
+
+	defer func() {
+		err := receiver.Close(context.Background())
+		require.NoError(t, err)
+	}()
+
+	// we'll send one message right now
+	send := func(count int) {
+		sender, err := session.NewSender(context.Background(), queue, nil)
+		require.NoError(t, err)
+
+		defer func() {
+			err := sender.Close(context.Background())
+			require.NoError(t, err)
+		}()
+
+		data := make([]byte, 1000)
+
+		for i := 0; i < count; i++ {
+			err = sender.Send(context.Background(), &amqp.Message{
+				Value: data,
+			}, nil)
+			require.NoError(t, err)
+		}
+	}
+
+	const totalSent = 1
+
+	// Send one message, but ask for two. This guarantees that we'll leave one active credit after
+	// we receive our single message.
+	send(totalSent)
+	err = receiver.IssueCredit(totalSent + 1) // request 2 messages, even though 1 is available. This will leave us with 1 extra credit.
+	require.NoError(t, err)
+
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, 1, len(receiveAllPrefetched(receiver)), "we received the single message that was available")
+
+	// now we'll drain - there's a single active credit that will now get thrown away
+	err = receiver.DrainCredit(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, receiveAllPrefetched(receiver)) // there weren't any messages to send to us
+
+	// Our receiver should have _zero_ active credits at this point
+	// because we've completed drain. We'll send a message _but_ since we have no
+	// active credits nothing will be sent to _our_ receiver.
+	send(1)
+	time.Sleep(200 * time.Millisecond)
+
+	// we haven't issued any credits so we _shouldn't_ get anything here unless there's a bug in
+	// our receiver, or in the broker.
+	require.Empty(t, receiveAllPrefetched(receiver))
+}
+
 func TestSenderNullValue(t *testing.T) {
 	if localBrokerAddr == "" {
 		t.Skip()
@@ -1247,4 +1318,18 @@ func testClose(t testing.TB, close func(context.Context) error) {
 	if err != nil {
 		t.Errorf("error closing: %+v\n", err)
 	}
+}
+
+func receiveAllPrefetched(receiver *amqp.Receiver) []*amqp.Message {
+	var messages []*amqp.Message
+
+	for {
+		if msg := receiver.Prefetched(); msg == nil {
+			break
+		} else {
+			messages = append(messages, msg)
+		}
+	}
+
+	return messages
 }

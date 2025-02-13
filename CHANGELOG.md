@@ -5,6 +5,7 @@
 ### Features Added
 
 * Added support in both `Sender` and `Receiver` to set the `desired-capabilities` in their ATTACH frames, using DesiredCapabilities in their respective Options.
+* Added Receiver.DrainCredit, which allows you to drain credits from a link.
 
 ### Bugs Fixed
 

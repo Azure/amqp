@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -28,7 +29,10 @@ func TestLinkFlowThatNeedsToReplenishCredits(t *testing.T) {
 			},
 		})
 
-		err := l.IssueCredit(1)
+		err := l.DrainCredit(context.Background())
+		require.Error(t, err, "drain can only be used with receiver links using manual credit management")
+
+		err = l.IssueCredit(1)
 		require.Error(t, err, "issueCredit can only be used with receiver links using manual credit management")
 
 		// we've consumed half of the maximum credit we're allowed to have - reflow!
@@ -103,6 +107,19 @@ func TestLinkFlowWithZeroCredits(t *testing.T) {
 	muxSem.Release(-1)
 }
 
+func TestLinkFlowDrain(t *testing.T) {
+	l := newTestLink(t)
+	// now initialize it as a manual credit link
+	l.autoSendFlow = false
+
+	go func() {
+		<-l.receiverReady
+		l.creditor.EndDrain()
+	}()
+
+	require.NoError(t, l.DrainCredit(context.Background()))
+}
+
 func TestLinkFlowWithManualCreditor(t *testing.T) {
 	l := newTestLink(t)
 	l.autoSendFlow = false
@@ -122,6 +139,51 @@ func TestLinkFlowWithManualCreditor(t *testing.T) {
 	default:
 		require.Fail(t, fmt.Sprintf("Unexpected frame was transferred: %+v", txFrame))
 	}
+}
+
+func TestLinkFlowWithDrain(t *testing.T) {
+	l := newTestLink(t)
+	l.autoSendFlow = false
+	go l.mux(receiverTestHooks{})
+	defer close(l.l.close)
+
+	errChan := make(chan error)
+
+	go func(errChan chan error) {
+		// flow happens immmediately in 'mux'
+		txFrame := <-l.l.session.tx
+
+		switch frame := txFrame.FrameBody.(type) {
+		case *frames.PerformFlow:
+			if !frame.Drain {
+				errChan <- errors.New("expected drain to be true")
+				return
+			}
+
+			// When we're draining we just automatically set the flow link credit to 0.
+			// This should allow any outstanding messages to get flushed.
+			if lc := *frame.LinkCredit; lc != 0 {
+				errChan <- fmt.Errorf("unepxected LinkCredit: %d", lc)
+				return
+			}
+
+		default:
+			errChan <- fmt.Errorf("Unexpected frame was transferred: %+v", txFrame)
+			return
+		}
+
+		// simulate the return of the flow from the service
+		if err := l.muxHandleFrame(&frames.PerformFlow{Drain: true}); err != nil {
+			errChan <- err
+			return
+		}
+
+		close(errChan)
+	}(errChan)
+
+	l.l.linkCredit = 1
+	require.NoError(t, l.DrainCredit(context.Background()))
+	require.NoError(t, <-errChan)
 }
 
 func TestLinkFlowWithManualCreditorAndNoFlowNeeded(t *testing.T) {
